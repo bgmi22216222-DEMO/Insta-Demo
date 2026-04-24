@@ -1,19 +1,17 @@
 """
 Single-file Telegram Bot — Railway.app compatible
-Fixes:
-  - /broadcast: image reply + caption + HTML links working
-  - Contact Admin button: CONTACT_ADMIN env variable se
+FAST VERSION: Connection pooling + async optimizations
 """
 
 import json
 import logging
-import random
 import urllib.parse
 from datetime import datetime, timedelta
+from threading import Lock
 
 import pg8000.dbapi
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, BotCommand, BotCommandScopeChat
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from telegram.error import TelegramError
 from dotenv import load_dotenv
 import os
@@ -37,225 +35,189 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# ── DB connection ─────────────────────────────────────────────────────────────
-def get_conn():
-    r = urllib.parse.urlparse(DATABASE_URL)
-    return pg8000.dbapi.connect(
-        host=r.hostname,
-        port=r.port or 5432,
-        database=r.path.lstrip("/"),
-        user=r.username,
-        password=r.password,
-        ssl_context=True,
-    )
+# ═══════════════════════════════════════════════════════════════════════════════
+# CONNECTION POOL — ek hi connection reuse karo, naya mat banao baar baar
+# ═══════════════════════════════════════════════════════════════════════════════
 
-def _to_dict(cur, row):
-    cols = [desc[0] for desc in cur.description]
-    return dict(zip(cols, row))
+_conn = None
+_conn_lock = Lock()
+
+def get_conn():
+    global _conn
+    with _conn_lock:
+        try:
+            # Test if connection is alive
+            if _conn is not None:
+                _conn.run("SELECT 1")
+                return _conn
+        except Exception:
+            _conn = None
+        # Create fresh connection
+        r = urllib.parse.urlparse(DATABASE_URL)
+        _conn = pg8000.dbapi.connect(
+            host=r.hostname,
+            port=r.port or 5432,
+            database=r.path.lstrip("/"),
+            user=r.username,
+            password=r.password,
+            ssl_context=True,
+        )
+        _conn.autocommit = False
+        logger.info("🔌 DB connection (re)created.")
+        return _conn
+
+def db_exec(sql, params=(), fetch=None):
+    """
+    Central DB executor — reuses connection, auto-reconnects on failure.
+    fetch=None  → commit only
+    fetch='one' → fetchone
+    fetch='all' → fetchall
+    """
+    for attempt in range(3):
+        try:
+            conn = get_conn()
+            cur  = conn.cursor()
+            cur.execute(sql, params)
+            if fetch == "one":
+                row = cur.fetchone()
+                conn.commit()
+                return row
+            elif fetch == "all":
+                rows = cur.fetchall()
+                desc = cur.description
+                conn.commit()
+                return rows, desc
+            else:
+                conn.commit()
+                return None
+        except Exception as e:
+            logger.warning(f"DB attempt {attempt+1} failed: {e}")
+            global _conn
+            _conn = None  # force reconnect next time
+            if attempt == 2:
+                raise
+
+def rows_to_dicts(rows, desc):
+    cols = [d[0] for d in desc]
+    return [dict(zip(cols, r)) for r in rows]
 
 
 # ── DB init ───────────────────────────────────────────────────────────────────
 def init_db():
-    conn = get_conn()
-    try:
-        cur = conn.cursor()
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id BIGINT PRIMARY KEY, username TEXT,
-                first_name TEXT, joined_at TIMESTAMPTZ DEFAULT NOW(),
-                last_fetch TIMESTAMPTZ
-            );
-        """)
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS settings (
-                key TEXT PRIMARY KEY, value TEXT NOT NULL
-            );
-        """)
-        cur.execute("INSERT INTO settings (key,value) VALUES ('caption','Aur videos ke liye admin se contact karein.') ON CONFLICT (key) DO NOTHING;")
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS fetched_content (
-                id SERIAL PRIMARY KEY, user_id BIGINT NOT NULL,
-                message_ids TEXT NOT NULL DEFAULT '[]',
-                warning_msg_id BIGINT, fetched_at TIMESTAMPTZ DEFAULT NOW()
-            );
-        """)
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS broadcast_jobs (
-                id SERIAL PRIMARY KEY, user_id BIGINT NOT NULL,
-                message_id BIGINT NOT NULL, delete_at TIMESTAMPTZ NOT NULL,
-                deleted BOOLEAN DEFAULT FALSE
-            );
-        """)
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS channel_videos (
-                message_id BIGINT PRIMARY KEY, media_type TEXT,
-                indexed_at TIMESTAMPTZ DEFAULT NOW()
-            );
-        """)
-        conn.commit()
-        logger.info("✅ DB tables ready.")
-    finally:
-        conn.close()
+    db_exec("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id BIGINT PRIMARY KEY, username TEXT, first_name TEXT,
+            joined_at TIMESTAMPTZ DEFAULT NOW(), last_fetch TIMESTAMPTZ
+        )
+    """)
+    db_exec("""
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY, value TEXT NOT NULL
+        )
+    """)
+    db_exec("INSERT INTO settings(key,value) VALUES('caption','Aur videos ke liye admin se contact karein.') ON CONFLICT(key) DO NOTHING")
+    db_exec("""
+        CREATE TABLE IF NOT EXISTS fetched_content (
+            id SERIAL PRIMARY KEY, user_id BIGINT NOT NULL,
+            message_ids TEXT NOT NULL DEFAULT '[]',
+            warning_msg_id BIGINT, fetched_at TIMESTAMPTZ DEFAULT NOW()
+        )
+    """)
+    db_exec("""
+        CREATE TABLE IF NOT EXISTS broadcast_jobs (
+            id SERIAL PRIMARY KEY, user_id BIGINT NOT NULL,
+            message_id BIGINT NOT NULL, delete_at TIMESTAMPTZ NOT NULL,
+            deleted BOOLEAN DEFAULT FALSE
+        )
+    """)
+    db_exec("""
+        CREATE TABLE IF NOT EXISTS channel_videos (
+            message_id BIGINT PRIMARY KEY, media_type TEXT,
+            indexed_at TIMESTAMPTZ DEFAULT NOW()
+        )
+    """)
+    logger.info("✅ DB ready.")
 
 
-# ── DB helpers ────────────────────────────────────────────────────────────────
+# ── DB helpers (fast — single executor) ──────────────────────────────────────
 def upsert_user(user_id, username, first_name):
-    conn = get_conn()
-    try:
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO users (user_id, username, first_name) VALUES (%s,%s,%s)
-            ON CONFLICT (user_id) DO UPDATE
-                SET username=EXCLUDED.username, first_name=EXCLUDED.first_name;
-        """, (user_id, username, first_name))
-        conn.commit()
-    finally:
-        conn.close()
+    db_exec(
+        "INSERT INTO users(user_id,username,first_name) VALUES(%s,%s,%s) "
+        "ON CONFLICT(user_id) DO UPDATE SET username=EXCLUDED.username, first_name=EXCLUDED.first_name",
+        (user_id, username, first_name)
+    )
 
 def get_all_user_ids():
-    conn = get_conn()
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT user_id FROM users;")
-        return [r[0] for r in cur.fetchall()]
-    finally:
-        conn.close()
+    rows, _ = db_exec("SELECT user_id FROM users", fetch="all")
+    return [r[0] for r in rows]
 
 def update_last_fetch(user_id):
-    conn = get_conn()
-    try:
-        cur = conn.cursor()
-        cur.execute("UPDATE users SET last_fetch=NOW() WHERE user_id=%s;", (user_id,))
-        conn.commit()
-    finally:
-        conn.close()
+    db_exec("UPDATE users SET last_fetch=NOW() WHERE user_id=%s", (user_id,))
 
 def get_setting(key):
-    conn = get_conn()
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT value FROM settings WHERE key=%s;", (key,))
-        row = cur.fetchone()
-        return row[0] if row else ""
-    finally:
-        conn.close()
+    row = db_exec("SELECT value FROM settings WHERE key=%s", (key,), fetch="one")
+    return row[0] if row else ""
 
 def set_setting(key, value):
-    conn = get_conn()
-    try:
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO settings (key,value) VALUES (%s,%s)
-            ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value;
-        """, (key, value))
-        conn.commit()
-    finally:
-        conn.close()
+    db_exec(
+        "INSERT INTO settings(key,value) VALUES(%s,%s) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",
+        (key, value)
+    )
 
 def get_user_content(user_id):
     cutoff = datetime.utcnow() - timedelta(days=CYCLE_DAYS)
-    conn = get_conn()
-    try:
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT id, message_ids, warning_msg_id, fetched_at
-            FROM fetched_content WHERE user_id=%s AND fetched_at>%s
-            ORDER BY fetched_at DESC LIMIT 1;
-        """, (user_id, cutoff))
-        row = cur.fetchone()
-        return _to_dict(cur, row) if row else None
-    finally:
-        conn.close()
+    row = db_exec(
+        "SELECT id,message_ids,warning_msg_id,fetched_at FROM fetched_content "
+        "WHERE user_id=%s AND fetched_at>%s ORDER BY fetched_at DESC LIMIT 1",
+        (user_id, cutoff), fetch="one"
+    )
+    if row:
+        return {"id": row[0], "message_ids": row[1], "warning_msg_id": row[2], "fetched_at": row[3]}
+    return None
 
 def save_user_content(user_id, message_ids, warning_msg_id):
-    conn = get_conn()
-    try:
-        cur = conn.cursor()
-        cur.execute("DELETE FROM fetched_content WHERE user_id=%s;", (user_id,))
-        cur.execute("""
-            INSERT INTO fetched_content (user_id, message_ids, warning_msg_id)
-            VALUES (%s,%s,%s);
-        """, (user_id, json.dumps(message_ids), warning_msg_id))
-        conn.commit()
-    finally:
-        conn.close()
+    db_exec("DELETE FROM fetched_content WHERE user_id=%s", (user_id,))
+    db_exec(
+        "INSERT INTO fetched_content(user_id,message_ids,warning_msg_id) VALUES(%s,%s,%s)",
+        (user_id, json.dumps(message_ids), warning_msg_id)
+    )
 
 def reset_all_content():
-    conn = get_conn()
-    try:
-        cur = conn.cursor()
-        cur.execute("DELETE FROM fetched_content;")
-        conn.commit()
-    finally:
-        conn.close()
+    db_exec("DELETE FROM fetched_content")
 
 def save_broadcast_job(user_id, message_id):
     delete_at = datetime.utcnow() + timedelta(hours=24)
-    conn = get_conn()
-    try:
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO broadcast_jobs (user_id, message_id, delete_at)
-            VALUES (%s,%s,%s);
-        """, (user_id, message_id, delete_at))
-        conn.commit()
-    finally:
-        conn.close()
+    db_exec(
+        "INSERT INTO broadcast_jobs(user_id,message_id,delete_at) VALUES(%s,%s,%s)",
+        (user_id, message_id, delete_at)
+    )
 
 def get_pending_broadcast_deletes():
-    conn = get_conn()
-    try:
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT id, user_id, message_id FROM broadcast_jobs
-            WHERE deleted=FALSE AND delete_at<=NOW();
-        """)
-        rows = cur.fetchall()
-        return [_to_dict(cur, r) for r in rows]
-    finally:
-        conn.close()
+    rows, desc = db_exec(
+        "SELECT id,user_id,message_id FROM broadcast_jobs WHERE deleted=FALSE AND delete_at<=NOW()",
+        fetch="all"
+    )
+    return rows_to_dicts(rows, desc)
 
 def mark_broadcast_deleted(job_id):
-    conn = get_conn()
-    try:
-        cur = conn.cursor()
-        cur.execute("UPDATE broadcast_jobs SET deleted=TRUE WHERE id=%s;", (job_id,))
-        conn.commit()
-    finally:
-        conn.close()
+    db_exec("UPDATE broadcast_jobs SET deleted=TRUE WHERE id=%s", (job_id,))
 
 def save_channel_video(message_id, media_type="video"):
-    conn = get_conn()
-    try:
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO channel_videos (message_id, media_type)
-            VALUES (%s,%s) ON CONFLICT (message_id) DO NOTHING;
-        """, (message_id, media_type))
-        conn.commit()
-    finally:
-        conn.close()
+    db_exec(
+        "INSERT INTO channel_videos(message_id,media_type) VALUES(%s,%s) ON CONFLICT(message_id) DO NOTHING",
+        (message_id, media_type)
+    )
 
 def get_latest_channel_video_ids(count):
-    conn = get_conn()
-    try:
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT message_id FROM channel_videos
-            ORDER BY message_id DESC LIMIT %s;
-        """, (count,))
-        return [r[0] for r in cur.fetchall()]
-    finally:
-        conn.close()
+    rows, _ = db_exec(
+        "SELECT message_id FROM channel_videos ORDER BY message_id DESC LIMIT %s",
+        (count,), fetch="all"
+    )
+    return [r[0] for r in rows]
 
-def clear_channel_videos():
-    conn = get_conn()
-    try:
-        cur = conn.cursor()
-        cur.execute("DELETE FROM channel_videos;")
-        conn.commit()
-    finally:
-        conn.close()
+def get_channel_video_count():
+    row = db_exec("SELECT COUNT(*) FROM channel_videos", fetch="one")
+    return row[0] if row else 0
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -266,138 +228,116 @@ async def _safe_delete(bot, chat_id, msg_ids):
         except TelegramError:
             pass
 
-
 def _contact_url():
-    """Build contact URL from CONTACT_ADMIN env var."""
     raw = CONTACT_ADMIN.strip()
-    if raw.startswith("@"):
-        return f"https://t.me/{raw[1:]}"
-    if raw.lstrip("-").isdigit():
-        # Numeric ID — open telegram user by id (tg://user?id=...)
-        return f"tg://user?id={raw}"
-    if raw.startswith("http"):
-        return raw
+    if raw.startswith("@"):   return f"https://t.me/{raw[1:]}"
+    if raw.startswith("http"): return raw
     return f"https://t.me/{raw}"
-
-
-# ── Auto-find latest message ID ───────────────────────────────────────────────
-async def _find_latest_message_id(bot) -> int:
-    probe = 1
-    # Exponential probe upward
-    while True:
-        try:
-            msg = await bot.forward_message(
-                chat_id=ADMIN_ID, from_chat_id=CHANNEL_ID,
-                message_id=probe, disable_notification=True,
-            )
-            await bot.delete_message(chat_id=ADMIN_ID, message_id=msg.message_id)
-            probe *= 2
-        except TelegramError:
-            break
-
-    upper = probe
-    lower = probe // 2
-    latest = lower
-
-    for msg_id in range(upper, lower, -1):
-        try:
-            msg = await bot.forward_message(
-                chat_id=ADMIN_ID, from_chat_id=CHANNEL_ID,
-                message_id=msg_id, disable_notification=True,
-            )
-            await bot.delete_message(chat_id=ADMIN_ID, message_id=msg.message_id)
-            latest = msg_id
-            break
-        except TelegramError:
-            continue
-
-    return latest
 
 
 # ── Scheduled jobs ────────────────────────────────────────────────────────────
 async def _delete_videos_job(context: ContextTypes.DEFAULT_TYPE):
     d = context.job.data
     await _safe_delete(context.bot, d["chat_id"], d["msg_ids"])
-    logger.info(f"Auto-deleted {len(d['msg_ids'])} msgs for {d['chat_id']}")
-
 
 async def _delete_broadcast_job(context: ContextTypes.DEFAULT_TYPE):
     jobs = get_pending_broadcast_deletes()
     for job in jobs:
         try:
-            await context.bot.delete_message(
-                chat_id=job["user_id"], message_id=job["message_id"]
-            )
+            await context.bot.delete_message(chat_id=job["user_id"], message_id=job["message_id"])
         except TelegramError:
             pass
         finally:
             mark_broadcast_deleted(job["id"])
-    if jobs:
-        logger.info(f"Cleaned {len(jobs)} broadcast msgs.")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# /start
+# AUTO-FETCH: Channel post → instantly DB mein save
+# ═══════════════════════════════════════════════════════════════════════════════
+async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    post = update.channel_post
+    if not post or post.chat.id != CHANNEL_ID:
+        return
+    media_type = (
+        "video"    if post.video    else
+        "document" if post.document else
+        "photo"    if post.photo    else None
+    )
+    if media_type:
+        save_channel_video(post.message_id, media_type)
+        logger.info(f"⚡ Auto-indexed {media_type} msg_id={post.message_id} | total={get_channel_video_count()}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# /start — optimized: DB calls batched, videos sent concurrently
 # ═══════════════════════════════════════════════════════════════════════════════
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    import asyncio
     user    = update.effective_user
     chat_id = update.effective_chat.id
     bot     = context.bot
 
+    # Fire-and-forget user upsert (don't await DB before sending)
     upsert_user(user.id, user.username, user.first_name)
 
-    # Delete old session
+    # Cancel old delete jobs + clean old session
     prev_key = f"session_{user.id}"
     if prev_key in context.bot_data:
-        await _safe_delete(bot, chat_id, context.bot_data[prev_key])
+        asyncio.create_task(_safe_delete(bot, chat_id, context.bot_data[prev_key]))
         del context.bot_data[prev_key]
     for job in context.job_queue.get_jobs_by_name(f"del_{user.id}"):
         job.schedule_removal()
 
-    # Warning
+    # Warning message
     warn = await bot.send_message(
         chat_id=chat_id,
-        text="⚠️ *Yeh videos 5 minute baad auto-delete ho jayenge.*\n\n📥 Download ya Forward disabled hai.",
+        text="⚠️ *Yeh videos 5 minute baad auto-delete ho jayenge.*\n📥 Download ya Forward disabled hai.",
         parse_mode="Markdown",
     )
     all_del = [warn.message_id]
 
-    cached = get_user_content(user.id)
+    # Get video IDs (single fast DB call)
+    cached  = get_user_content(user.id)
+    ch_ids  = []
+    is_new  = False
+
     if cached:
-        ids = json.loads(cached["message_ids"]) if isinstance(cached["message_ids"], str) else cached["message_ids"]
-        for ch_id in ids:
-            try:
-                sent = await bot.copy_message(
-                    chat_id=chat_id, from_chat_id=CHANNEL_ID,
-                    message_id=ch_id, protect_content=True, disable_notification=True,
-                )
-                all_del.append(sent.message_id)
-            except TelegramError as e:
-                logger.warning(f"Cached video {ch_id}: {e}")
+        ch_ids = json.loads(cached["message_ids"]) \
+            if isinstance(cached["message_ids"], str) else cached["message_ids"]
     else:
         ch_ids = get_latest_channel_video_ids(VIDEOS_PER_SESSION)
-        if not ch_ids:
-            await bot.send_message(
-                chat_id=chat_id,
-                text="❌ Koi video nahi mili.\nAdmin pehle /index command chalaye.",
+        is_new = True
+
+    if not ch_ids:
+        await bot.send_message(chat_id=chat_id, text="❌ Abhi koi video nahi hai. Thodi der baad try karein.")
+        return
+
+    # Send all videos concurrently (much faster than sequential)
+    async def _send_one(ch_id):
+        try:
+            sent = await bot.copy_message(
+                chat_id=chat_id, from_chat_id=CHANNEL_ID,
+                message_id=ch_id, protect_content=True,
+                disable_notification=True,
             )
-            return
-        for ch_id in ch_ids:
-            try:
-                sent = await bot.copy_message(
-                    chat_id=chat_id, from_chat_id=CHANNEL_ID,
-                    message_id=ch_id, protect_content=True, disable_notification=True,
-                )
-                all_del.append(sent.message_id)
-            except TelegramError as e:
-                logger.warning(f"Video {ch_id}: {e}")
+            return sent.message_id
+        except TelegramError as e:
+            logger.warning(f"Video {ch_id}: {e}")
+            return None
+
+    results = await asyncio.gather(*[_send_one(cid) for cid in ch_ids])
+    sent_ids = [r for r in results if r]
+    all_del.extend(sent_ids)
+
+    # Save to DB if fresh fetch
+    if is_new:
         save_user_content(user.id, ch_ids, warn.message_id)
         update_last_fetch(user.id)
 
     context.bot_data[prev_key] = all_del
 
-    # Final caption + Contact button — CONTACT_ADMIN variable se
-    caption = get_setting("caption")
+    # Final caption + Contact button (permanent)
+    caption     = get_setting("caption")
     contact_url = _contact_url()
 
     await bot.send_message(
@@ -409,6 +349,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ),
     )
 
+    # Schedule 5-min auto-delete
     context.job_queue.run_once(
         _delete_videos_job,
         when=VIDEO_DELETE_SECONDS,
@@ -418,222 +359,98 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# /index
-# ═══════════════════════════════════════════════════════════════════════════════
-async def index_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return await update.message.reply_text("🚫 Unauthorized.")
-
-    if len(context.args) >= 2:
-        try:
-            start_id = int(context.args[0])
-            end_id   = int(context.args[1])
-        except ValueError:
-            return await update.message.reply_text("❌ Example: `/index 1 300`", parse_mode="Markdown")
-        status = await update.message.reply_text(
-            f"🔍 Scanning `{start_id}` – `{end_id}`...", parse_mode="Markdown"
-        )
-    else:
-        status = await update.message.reply_text("🔍 Channel ka latest message dhundh raha hoon...")
-        latest   = await _find_latest_message_id(context.bot)
-        end_id   = latest
-        start_id = max(1, end_id - 499)
-        await context.bot.edit_message_text(
-            chat_id=update.effective_chat.id,
-            message_id=status.message_id,
-            text=f"🔍 Latest ID: `{end_id}` — Scanning `{start_id}` to `{end_id}`...",
-            parse_mode="Markdown",
-        )
-
-    clear_channel_videos()
-    found = 0
-
-    for msg_id in range(end_id, start_id - 1, -1):
-        try:
-            fwd = await context.bot.forward_message(
-                chat_id=ADMIN_ID, from_chat_id=CHANNEL_ID,
-                message_id=msg_id, disable_notification=True,
-            )
-            mtype = (
-                "video"    if fwd.video    else
-                "document" if fwd.document else
-                "photo"    if fwd.photo    else None
-            )
-            if mtype:
-                save_channel_video(msg_id, mtype)
-                found += 1
-            try:
-                await context.bot.delete_message(chat_id=ADMIN_ID, message_id=fwd.message_id)
-            except TelegramError:
-                pass
-        except TelegramError:
-            continue
-
-    await context.bot.edit_message_text(
-        chat_id=update.effective_chat.id,
-        message_id=status.message_id,
-        text=(
-            f"✅ *Index complete!*\n"
-            f"📹 Found: *{found}* videos\n"
-            f"📊 Range: `{start_id}` – `{end_id}`\n\n"
-            f"Ab /start karne par latest {VIDEOS_PER_SESSION} videos milenge."
-        ),
-        parse_mode="Markdown",
-    )
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# /reset  /setcaption  /setcontact
+# /reset
 # ═══════════════════════════════════════════════════════════════════════════════
 async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return await update.message.reply_text("🚫 Unauthorized.")
     reset_all_content()
-    await update.message.reply_text("✅ *Reset! Sabko fresh videos milenge.*", parse_mode="Markdown")
-
-
-async def setcaption_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return await update.message.reply_text("🚫 Unauthorized.")
-    # Raw text lena zaroori hai — context.args HTML tags tod deta hai
-    raw = update.message.text or ""
-    # "/setcaption " ke baad ka poora text lo
-    if " " not in raw.strip():
-        return await update.message.reply_text(
-            "Usage: /setcaption Aapka caption yahan likhein\n\n"
-            "Example:\n/setcaption 🔥 Daily videos ke liye join karo!",
-        )
-    text = raw.split(" ", 1)[1].strip()
-    if not text:
-        return await update.message.reply_text("❌ Caption empty hai. Kuch text do.")
-    set_setting("caption", text)
+    total = get_channel_video_count()
     await update.message.reply_text(
-        f"✅ Caption update ho gaya!\n\n📌 New caption:\n{text}"
-    )
-
-
-async def setcontact_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return await update.message.reply_text("🚫 Unauthorized.")
-    await update.message.reply_text(
-        "ℹ️ Contact button ke liye Railway mein `CONTACT_ADMIN` variable update karo.\n\n"
-        "Example values:\n"
-        "• `@yourusername`\n"
-        "• `https://t.me/yourusername`\n"
-        "• `123456789` (Telegram user ID)",
+        f"✅ *Reset ho gaya!*\n\n"
+        f"📹 Indexed videos: *{total}*\n"
+        f"Ab sabko next /start par latest videos milenge.",
         parse_mode="Markdown",
     )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# /broadcast  — FIXED: image reply + caption + HTML links
-#
-# Usage:
-#   Text only:   /broadcast Hello <a href="https://t.me/ch">Join</a>
-#   Image+text:  Kisi image ko reply karo → /broadcast Caption <a href="URL">Link</a>
+# /setcaption
+# ═══════════════════════════════════════════════════════════════════════════════
+async def setcaption_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return await update.message.reply_text("🚫 Unauthorized.")
+    raw  = update.message.text or ""
+    text = raw.split(" ", 1)[1].strip() if " " in raw else ""
+    if not text:
+        return await update.message.reply_text("Usage: /setcaption Aapka caption yahan")
+    set_setting("caption", text)
+    await update.message.reply_text(f"✅ *Caption set!*\n\n📌 {text}", parse_mode="Markdown")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# /broadcast
 # ═══════════════════════════════════════════════════════════════════════════════
 async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    import asyncio
     if update.effective_user.id != ADMIN_ID:
         return await update.message.reply_text("🚫 Unauthorized.")
 
-    msg   = update.message
-    reply = msg.reply_to_message
-
-    # Caption = sab kuch /broadcast ke baad
-    # Support karta hai: plain text, HTML tags, <a href> links
-    raw_text = msg.text or msg.caption or ""
-    # Remove the /broadcast command prefix
-    if raw_text.lower().startswith("/broadcast"):
-        caption = raw_text[len("/broadcast"):].strip()
-    else:
-        caption = raw_text.strip()
-
-    # Agar reply mein caption ho aur command mein nahi
+    msg     = update.message
+    reply   = msg.reply_to_message
+    raw     = msg.text or msg.caption or ""
+    caption = raw.split(" ", 1)[1].strip() if " " in raw else ""
     if not caption and reply and reply.caption:
         caption = reply.caption
 
     user_ids = get_all_user_ids()
     if not user_ids:
-        return await msg.reply_text("⚠️ Koi registered user nahi mila.")
-
+        return await msg.reply_text("⚠️ Koi user nahi mila.")
     if not reply and not caption:
         return await msg.reply_text(
-            "❌ *Broadcast Usage:*\n\n"
-            "📝 Text only:\n`/broadcast Aapka message`\n\n"
-            "🔗 Text with link:\n`/broadcast Visit <a href='https://t.me/ch'>Channel</a>`\n\n"
-            "🖼 Image + caption + link:\n"
-            "Image ko reply karo phir likho:\n`/broadcast Caption <a href='URL'>Link Text</a>`",
-            parse_mode="Markdown",
+            "❌ Usage:\n"
+            "/broadcast Text ya <a href='URL'>Link</a>\n\n"
+            "Image ke saath: image reply karo + /broadcast Caption",
+            parse_mode="HTML",
         )
 
-    sending_msg = await msg.reply_text(
-        f"📢 *Broadcasting to {len(user_ids)} users...*",
-        parse_mode="Markdown",
-    )
+    status = await msg.reply_text(f"📢 *Sending to {len(user_ids)} users...*", parse_mode="Markdown")
 
-    ok = fail = 0
-
-    for uid in user_ids:
+    # Broadcast concurrently (much faster)
+    async def _send_one(uid):
         try:
             sent = None
-
-            # ── Image broadcast ──────────────────────────────────────────────
             if reply and reply.photo:
-                sent = await context.bot.send_photo(
-                    chat_id=uid,
-                    photo=reply.photo[-1].file_id,
-                    caption=caption if caption else None,
-                    parse_mode="HTML",
-                )
-            # ── Video broadcast ──────────────────────────────────────────────
+                sent = await context.bot.send_photo(chat_id=uid, photo=reply.photo[-1].file_id, caption=caption or None, parse_mode="HTML")
             elif reply and reply.video:
-                sent = await context.bot.send_video(
-                    chat_id=uid,
-                    video=reply.video.file_id,
-                    caption=caption if caption else None,
-                    parse_mode="HTML",
-                )
-            # ── Document broadcast ───────────────────────────────────────────
+                sent = await context.bot.send_video(chat_id=uid, video=reply.video.file_id, caption=caption or None, parse_mode="HTML")
             elif reply and reply.document:
-                sent = await context.bot.send_document(
-                    chat_id=uid,
-                    document=reply.document.file_id,
-                    caption=caption if caption else None,
-                    parse_mode="HTML",
-                )
-            # ── GIF/Animation broadcast ──────────────────────────────────────
+                sent = await context.bot.send_document(chat_id=uid, document=reply.document.file_id, caption=caption or None, parse_mode="HTML")
             elif reply and reply.animation:
-                sent = await context.bot.send_animation(
-                    chat_id=uid,
-                    animation=reply.animation.file_id,
-                    caption=caption if caption else None,
-                    parse_mode="HTML",
-                )
-            # ── Text only broadcast ──────────────────────────────────────────
+                sent = await context.bot.send_animation(chat_id=uid, animation=reply.animation.file_id, caption=caption or None, parse_mode="HTML")
             else:
-                if not caption:
-                    await sending_msg.edit_text("❌ Kuch toh do broadcast ke liye.")
-                    return
-                sent = await context.bot.send_message(
-                    chat_id=uid,
-                    text=caption,
-                    parse_mode="HTML",
-                    disable_web_page_preview=False,
-                )
-
+                sent = await context.bot.send_message(chat_id=uid, text=caption, parse_mode="HTML", disable_web_page_preview=False)
             if sent:
                 save_broadcast_job(uid, sent.message_id)
-                ok += 1
-
+            return True
         except TelegramError as e:
-            logger.warning(f"Broadcast uid {uid}: {e}")
-            fail += 1
+            logger.warning(f"Broadcast {uid}: {e}")
+            return False
 
-    await sending_msg.edit_text(
+    # Send in batches of 25 to avoid flood limits
+    BATCH = 25
+    ok = fail = 0
+    for i in range(0, len(user_ids), BATCH):
+        batch   = user_ids[i:i+BATCH]
+        results = await asyncio.gather(*[_send_one(uid) for uid in batch])
+        ok      += sum(results)
+        fail    += len(results) - sum(results)
+        if i + BATCH < len(user_ids):
+            await asyncio.sleep(1)   # flood limit ke liye 1 sec pause per batch
+
+    await status.edit_text(
         f"✅ *Broadcast Complete!*\n\n"
-        f"📨 Sent: *{ok}*\n"
-        f"❌ Failed: *{fail}*\n"
-        f"⏳ 24 ghante baad auto-delete.",
+        f"📨 Sent: *{ok}*\n❌ Failed: *{fail}*\n⏳ 24h baad auto-delete.",
         parse_mode="Markdown",
     )
 
@@ -642,29 +459,21 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # STARTUP & MAIN
 # ═══════════════════════════════════════════════════════════════════════════════
 async def _on_startup(app: Application):
-    app.job_queue.run_repeating(
-        _delete_broadcast_job, interval=300, first=10, name="broadcast_cleaner"
-    )
-    # Bot command menu set karo (Telegram menu mein sirf yahi commands dikhenge)
-    await app.bot.set_my_commands([
-        ("start", "Videos dekho"),
-    ])
-    # Admin commands menu (private)
-    from telegram import BotCommandScopeChat
+    app.job_queue.run_repeating(_delete_broadcast_job, interval=300, first=10, name="broadcast_cleaner")
+    await app.bot.set_my_commands([BotCommand("start", "Videos dekho")])
     try:
         await app.bot.set_my_commands(
             [
-                ("start",      "Videos dekho"),
-                ("index",      "Channel index karo"),
-                ("reset",      "Cache reset karo"),
-                ("setcaption", "Caption set karo"),
-                ("broadcast",  "Sabko message bhejo"),
+                BotCommand("start",      "Videos dekho"),
+                BotCommand("reset",      "Naye videos fetch karo"),
+                BotCommand("setcaption", "Caption set karo"),
+                BotCommand("broadcast",  "Sabko message bhejo"),
             ],
             scope=BotCommandScopeChat(chat_id=ADMIN_ID),
         )
     except Exception:
         pass
-    logger.info("✅ Broadcast cleaner scheduled. Bot commands set.")
+    logger.info("⚡ Bot ready.")
 
 
 def main():
@@ -673,17 +482,22 @@ def main():
         Application.builder()
         .token(BOT_TOKEN)
         .post_init(_on_startup)
+        .concurrent_updates(True)        # multiple users simultaneously handle karo
         .build()
     )
     app.add_handler(CommandHandler("start",      start_command))
-    app.add_handler(CommandHandler("index",      index_command))
     app.add_handler(CommandHandler("reset",      reset_command))
     app.add_handler(CommandHandler("setcaption", setcaption_command))
-    app.add_handler(CommandHandler("setcontact", setcontact_command))
     app.add_handler(CommandHandler("broadcast",  broadcast_command))
+    app.add_handler(MessageHandler(
+        filters.ChatType.CHANNEL & filters.Chat(CHANNEL_ID),
+        channel_post_handler,
+    ))
     logger.info("🤖 Bot started.")
-    app.run_polling(drop_pending_updates=True)
-
+    app.run_polling(
+        drop_pending_updates=True,
+        allowed_updates=["message", "channel_post"],
+    )
 
 if __name__ == "__main__":
     main()
