@@ -115,7 +115,7 @@ def init_db():
             key TEXT PRIMARY KEY, value TEXT NOT NULL
         )
     """)
-    db_exec("INSERT INTO settings(key,value) VALUES('caption','Aur videos ke liye PREMIUM Buy Kre.') ON CONFLICT(key) DO NOTHING")
+    db_exec("INSERT INTO settings(key,value) VALUES('caption','Aur VDOS Ke Liye PREMIUM Buy Kre.') ON CONFLICT(key) DO NOTHING")
     db_exec("""
         CREATE TABLE IF NOT EXISTS fetched_content (
             id SERIAL PRIMARY KEY, user_id BIGINT NOT NULL,
