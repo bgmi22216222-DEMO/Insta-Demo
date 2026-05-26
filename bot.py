@@ -115,7 +115,7 @@ def init_db():
             key TEXT PRIMARY KEY, value TEXT NOT NULL
         )
     """)
-    db_exec("INSERT INTO settings(key,value) VALUES('caption','Aur videos ke liye admin se contact karein.') ON CONFLICT(key) DO NOTHING")
+    db_exec("INSERT INTO settings(key,value) VALUES('caption','Aur videos ke liye PREMIUM Buy Kre.') ON CONFLICT(key) DO NOTHING")
     db_exec("""
         CREATE TABLE IF NOT EXISTS fetched_content (
             id SERIAL PRIMARY KEY, user_id BIGINT NOT NULL,
@@ -345,7 +345,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text=f"📌 *{caption}*",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton("📩 Contact Admin", url=contact_url)]]
+            [[InlineKeyboardButton("📩 BUY PREMIUM", url=contact_url)]]
         ),
     )
 
