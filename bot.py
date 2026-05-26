@@ -342,7 +342,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await bot.send_message(
         chat_id=chat_id,
-        text=f"📌 *{caption}*",
+        text=f" *{caption}*",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(
             [[InlineKeyboardButton("📩 BUY PREMIUM", url=contact_url)]]
