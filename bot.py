@@ -385,7 +385,7 @@ async def setcaption_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not text:
         return await update.message.reply_text("Usage: /setcaption Aapka caption yahan")
     set_setting("caption", text)
-    await update.message.reply_text(f"✅ *Caption set!*\n\n📌 {text}", parse_mode="Markdown")
+    await update.message.reply_text(f"✅ *Caption set!*\n\n {text}", parse_mode="Markdown")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
